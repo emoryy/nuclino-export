@@ -50,7 +50,7 @@ python3 nuclino_export.py --output ./my-backup/ --format json
 
 # Also produce .docx files for each item (requires pandoc on PATH).
 # Combine formats with a comma:
-python3 nuclino_export.py --output ./my-backup/ --format markdown,json,docx
+python3 nuclino_export.py --output ./my-backup/ --format md,json,docx
 
 # Slow it down if you keep hitting 429s (default 0.5s between calls)
 python3 nuclino_export.py --output ./my-backup/ --throttle 1.0

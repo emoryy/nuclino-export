@@ -85,32 +85,25 @@ def workspace_dirname(ws: dict, all_workspaces: list[dict]) -> str:
 
 # --- format parsing ---------------------------------------------------------
 
-VALID_FORMATS = {"markdown", "json", "docx"}
-_FORMAT_ALIASES = {"md": "markdown", "markdown": "markdown",
-                   "json": "json", "docx": "docx"}
+VALID_FORMATS = {"md", "json", "docx"}
 
 
 def parse_formats(spec: str) -> set[str]:
     """Parse a comma-separated format spec into a set of canonical names.
 
-    Accepts 'markdown', 'md', 'json', 'docx', and the legacy 'both'
-    (= markdown + json).
+    Accepts 'md', 'json', 'docx'.
     """
     tokens = [t.strip().lower() for t in spec.split(",") if t.strip()]
     if not tokens:
         raise SystemExit("--format cannot be empty")
     out: set[str] = set()
     for t in tokens:
-        if t == "both":
-            out.update({"markdown", "json"})
-            continue
-        canonical = _FORMAT_ALIASES.get(t)
-        if not canonical:
+        if t not in VALID_FORMATS:
             raise SystemExit(
                 f"Unknown format '{t}'. Choose from: "
                 f"{', '.join(sorted(VALID_FORMATS))} (or comma-separated combos)."
             )
-        out.add(canonical)
+        out.add(t)
     return out
 
 
@@ -392,7 +385,7 @@ def export_workspace(ws: dict, ws_dir_name: str, entries: list[dict],
     summary = {"workspace": ws_name, "items": 0, "collections": 0,
                "files": 0, "docx": 0, "errors": 0}
     write_json = "json" in formats
-    write_md = "markdown" in formats
+    write_md = "md" in formats
     write_docx_fmt = "docx" in formats
     # Cumulative URL-filename -> local-attachment-filename map for this workspace.
     # Built incrementally as we download files; used for image link rewriting.
@@ -618,11 +611,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Limit to specific workspace ID(s). Repeatable. Default: all workspaces.",
     )
     p.add_argument(
-        "--format", default="markdown,json", metavar="FORMATS",
-        help="Comma-separated output formats per item: any of 'markdown' "
-             "(or 'md'), 'json', 'docx'. Default: %(default)s. The legacy "
-             "value 'both' is accepted as an alias for 'markdown,json'. "
-             "'docx' requires pandoc on PATH.",
+        "--format", default="md,json", metavar="FORMATS",
+        help="Comma-separated output formats per item: any of 'md', 'json', "
+             "'docx'. Default: %(default)s. 'docx' requires pandoc on PATH.",
     )
     p.add_argument(
         "--skip-files", action="store_true",
