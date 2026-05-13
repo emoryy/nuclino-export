@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Local secrets
+.env
+*.token
+nuclino-token*
+
+# Export output (anything that looks like a backup dir)
+export-*/
+exports/
+output/
+backup*/
+*.log
+manifest.json
