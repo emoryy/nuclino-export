@@ -81,7 +81,7 @@ Each `.md` file starts with a frontmatter block that mirrors key API fields:
 ---
 nuclino_id: 82b65370-f216-466b-a1aa-ca750fa60ac2
 title: "2023.05.30. Architect meeting"
-workspace: "DBX Architects"
+workspace: "Engineering"
 workspace_id: 350188e0-e3fe-488f-bf9a-55431ec81115
 url: "https://app.nuclino.com/t/b/82b65370-..."
 created: 2023-05-30T14:10:25.048Z
@@ -116,3 +116,7 @@ If you see repeated 429s, raise `--throttle` to `1.0` or higher.
 - **Embedded interactive blocks**: rendered to whatever the API returns in the
   `content` markdown field. Some Nuclino-specific block syntax (mention chips,
   drawing canvases) may degrade.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
