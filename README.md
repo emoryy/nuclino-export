@@ -13,6 +13,7 @@ where it left off.
 - Python 3.10 or newer
 - A Nuclino API token (see below)
 - Network access to `api.nuclino.com` and `nuclino-files.s3.eu-central-1.amazonaws.com`
+- Optional: [pandoc](https://pandoc.org/) on PATH if you want `.docx` output
 
 No external Python packages are needed; the tool uses the standard library only.
 
@@ -47,6 +48,10 @@ python3 nuclino_export.py --output ./my-backup/ --skip-files
 # JSON only, no markdown rendering
 python3 nuclino_export.py --output ./my-backup/ --format json
 
+# Also produce .docx files for each item (requires pandoc on PATH).
+# Combine formats with a comma:
+python3 nuclino_export.py --output ./my-backup/ --format markdown,json,docx
+
 # Slow it down if you keep hitting 429s (default 0.5s between calls)
 python3 nuclino_export.py --output ./my-backup/ --throttle 1.0
 ```
@@ -58,6 +63,7 @@ Run `python3 nuclino_export.py --help` for the full flag list.
 ```
 <output>/
   manifest.json                            # run metadata + counters per team/workspace
+  _index.json                              # global item-id -> {workspace, basename, title} map
   errors.log                               # per-failure log lines
   workspaces/
     <slug>/                                # human-readable workspace slug
@@ -66,6 +72,7 @@ Run `python3 nuclino_export.py --help` for the full flag list.
       items/
         <title-slug>__<short-id>.json      # full item JSON (with content body)
         <title-slug>__<short-id>.md        # markdown rendering with YAML frontmatter
+        <title-slug>__<short-id>.docx      # Word/Docs-ready rendering (when --format includes docx)
       files/
         <stem>__<short-id>.<ext>           # attachment; original filename preserved, short-id appended
 ```
@@ -96,6 +103,29 @@ child_item_ids:
 
 Both `item` (pages) and `collection` (folders/clusters) objects are saved as
 JSON. Only `item` objects get a markdown file, since collections have no body.
+
+## Link rewriting
+
+Nuclino-hosted URLs embedded in the markdown content will stop resolving the
+moment the source account loses access (subscription ends, token rotated,
+permissions changed). To keep the export self-contained, the tool rewrites
+those URLs at write time for both `.md` and `.docx` output (raw `.json` keeps
+the API response verbatim):
+
+- **Inline images** (`https://files.nuclino.com/files/.../<filename>`) are
+  rewritten to a relative path under the workspace's `files/` directory, so
+  pandoc embeds them into the `.docx` and markdown viewers render them inline.
+- **User mentions** (`[Name](https://app.nuclino.com/users/...)`) lose the
+  dead profile link; the display name is kept as plain text.
+- **Cross-document references** (`/t/b/<uuid>` and the longer team-path form)
+  are resolved to the local relative path of the target item using a global
+  index built during a discovery pre-pass. References to items that aren't in
+  the export (e.g. when `--workspace` filters the run) keep only the link
+  text.
+
+The discovery pre-pass enumerates all items across all workspaces in scope
+before any output is written; this adds roughly one list API call per
+workspace, but lets every cross-reference resolve to its eventual filename.
 
 ## Rate limiting and retries
 

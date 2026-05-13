@@ -10,6 +10,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -81,6 +83,140 @@ def workspace_dirname(ws: dict, all_workspaces: list[dict]) -> str:
     return slug
 
 
+# --- format parsing ---------------------------------------------------------
+
+VALID_FORMATS = {"markdown", "json", "docx"}
+_FORMAT_ALIASES = {"md": "markdown", "markdown": "markdown",
+                   "json": "json", "docx": "docx"}
+
+
+def parse_formats(spec: str) -> set[str]:
+    """Parse a comma-separated format spec into a set of canonical names.
+
+    Accepts 'markdown', 'md', 'json', 'docx', and the legacy 'both'
+    (= markdown + json).
+    """
+    tokens = [t.strip().lower() for t in spec.split(",") if t.strip()]
+    if not tokens:
+        raise SystemExit("--format cannot be empty")
+    out: set[str] = set()
+    for t in tokens:
+        if t == "both":
+            out.update({"markdown", "json"})
+            continue
+        canonical = _FORMAT_ALIASES.get(t)
+        if not canonical:
+            raise SystemExit(
+                f"Unknown format '{t}'. Choose from: "
+                f"{', '.join(sorted(VALID_FORMATS))} (or comma-separated combos)."
+            )
+        out.add(canonical)
+    return out
+
+
+# --- link rewriting ---------------------------------------------------------
+
+_IMAGE_RE = re.compile(
+    r"!\[([^\]]*)\]\(https://files\.nuclino\.com/files/[^/]+/([^)]+)\)"
+)
+_USER_LINK_RE = re.compile(
+    r"\[([^\]]+)\]\(https://app\.nuclino\.com/users/[^)]+\)"
+)
+_UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_ITEM_TB_LINK_RE = re.compile(
+    rf"\[([^\]]+)\]\(https://app\.nuclino\.com/t/b/({_UUID_PATTERN})[^)]*\)"
+)
+_ITEM_TEAM_LINK_RE = re.compile(
+    rf"\[([^\]]+)\]\(https://app\.nuclino\.com/[^/]+/[^/]+/[^)]*-({_UUID_PATTERN})[^)]*\)"
+)
+
+
+def rewrite_links(
+    content: str,
+    *,
+    item_index: dict,
+    this_ws_dir: str,
+    file_by_url_name: dict,
+    target_ext: str,
+) -> str:
+    """Rewrite Nuclino URLs to local references.
+
+    - Inline images: rewritten to `../files/<localname>` when a matching local
+      attachment is known. Unknown attachments are left untouched.
+    - User mention links: the URL is dropped, only the display name remains.
+    - Cross-doc references (`/t/b/<uuid>` and team-path forms): rewritten to a
+      relative path to the target item's local file with `target_ext`.
+      Unresolvable references (UUID not in the index) keep only the link text.
+    """
+    def image_repl(m: re.Match) -> str:
+        alt, url_name = m.group(1), m.group(2)
+        local = file_by_url_name.get(url_name)
+        if not local:
+            # Fallback for exports whose on-disk stems were truncated to the
+            # first 8 hex chars by an earlier rename pass: try the 8-char
+            # prefix of the URL filename stem.
+            if "." in url_name:
+                stem, ext = url_name.rsplit(".", 1)
+                local = file_by_url_name.get(f"{stem[:8]}.{ext}")
+            else:
+                local = file_by_url_name.get(url_name[:8])
+        if not local:
+            return m.group(0)
+        return f"![{alt}](../files/{local})"
+
+    def user_repl(m: re.Match) -> str:
+        return m.group(1)
+
+    def item_repl(m: re.Match) -> str:
+        text, uuid = m.group(1), m.group(2)
+        info = item_index.get(uuid)
+        if not info:
+            return text
+        if info.get("object") != "item":
+            return text
+        target_ws_dir = info["ws_dir"]
+        target_basename = info["basename"]
+        if target_ws_dir == this_ws_dir:
+            target_path = f"{target_basename}{target_ext}"
+        else:
+            target_path = f"../../{target_ws_dir}/items/{target_basename}{target_ext}"
+        return f"[{text}]({target_path})"
+
+    content = _IMAGE_RE.sub(image_repl, content)
+    content = _USER_LINK_RE.sub(user_repl, content)
+    content = _ITEM_TB_LINK_RE.sub(item_repl, content)
+    content = _ITEM_TEAM_LINK_RE.sub(item_repl, content)
+    return content
+
+
+# --- docx output ------------------------------------------------------------
+
+def write_docx(md_source: Path, docx_path: Path) -> None:
+    """Convert a markdown file to .docx using pandoc, with --resource-path set
+    so relative image references like `../files/foo.png` resolve correctly.
+    """
+    resource_path = str(md_source.parent.resolve())
+    subprocess.run(
+        [
+            "pandoc",
+            "--from", "markdown+yaml_metadata_block",
+            "--to", "docx",
+            f"--resource-path={resource_path}",
+            "--output", str(docx_path),
+            str(md_source),
+        ],
+        check=True,
+    )
+
+
+def require_pandoc() -> None:
+    if shutil.which("pandoc") is None:
+        raise SystemExit(
+            "pandoc not found on PATH. Install pandoc to use --format docx, "
+            "or drop docx from --format."
+        )
+
+
 def throttle() -> None:
     global _last_request_time
     elapsed = time.time() - _last_request_time
@@ -143,9 +279,11 @@ def yaml_quote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def write_markdown(md_path: Path, item: dict, workspace_name: str) -> None:
+def render_markdown(item: dict, content: str, workspace_name: str) -> str:
+    """Render an item to markdown text (frontmatter + body) using the
+    supplied (already-rewritten) content body.
+    """
     title = item.get("title", "") or ""
-    content = item.get("content", "") or ""
     meta = item.get("contentMeta") or {}
     file_ids = meta.get("fileIds") or []
     child_ids = meta.get("itemIds") or []
@@ -179,14 +317,69 @@ def write_markdown(md_path: Path, item: dict, workspace_name: str) -> None:
         fm.append(f"# {title}")
         fm.append("")
     fm.append(content)
-    md_path.write_text("\n".join(fm), encoding="utf-8")
+    return "\n".join(fm)
 
 
-def export_workspace(ws: dict, all_workspaces: list[dict], formats: set[str],
-                     download_files: bool, counters: dict) -> dict:
+def list_workspace_items(ws_id: str) -> list[dict]:
+    """Paginate through all items/collections in a workspace, returning the
+    raw list entries (no per-item GET)."""
+    entries: list[dict] = []
+    after: str | None = None
+    while True:
+        params: dict = {"workspaceId": ws_id, "limit": 100}
+        if after:
+            params["after"] = after
+        resp = api_get("/items", params)
+        results = resp.get("data", {}).get("results", [])
+        if not results:
+            break
+        entries.extend(results)
+        if len(results) < 100:
+            break
+        after = results[-1]["id"]
+    return entries
+
+
+def discover(teams: list[dict], workspace_filter: set[str]
+             ) -> tuple[dict, dict, list[tuple[dict, dict, list[dict]]]]:
+    """Discovery pass: enumerate all items across the (filtered) workspaces.
+
+    Returns:
+      item_index: item_id -> {ws_dir, ws_name, title, basename, object}
+      ws_dir_by_id: ws_id -> resolved directory name (slug or slug__shortid)
+      plan: list of (team, workspace, entries) tuples in iteration order
+    """
+    item_index: dict = {}
+    ws_dir_by_id: dict = {}
+    plan: list[tuple[dict, dict, list[dict]]] = []
+    for team in teams:
+        ws_list = api_get("/workspaces", {"teamId": team["id"]})["data"]["results"]
+        for ws in ws_list:
+            if workspace_filter and ws["id"] not in workspace_filter:
+                continue
+            ws_dir = workspace_dirname(ws, ws_list)
+            ws_dir_by_id[ws["id"]] = ws_dir
+            print(f"  listing {ws['name']} ...", flush=True)
+            entries = list_workspace_items(ws["id"])
+            for e in entries:
+                item_index[e["id"]] = {
+                    "ws_id": ws["id"],
+                    "ws_dir": ws_dir,
+                    "ws_name": ws["name"],
+                    "title": e.get("title", "") or "",
+                    "basename": item_basename(e.get("title", "") or "", e["id"]),
+                    "object": e.get("object"),
+                }
+            plan.append((team, ws, entries))
+    return item_index, ws_dir_by_id, plan
+
+
+def export_workspace(ws: dict, ws_dir_name: str, entries: list[dict],
+                     formats: set[str], download_files: bool,
+                     item_index: dict, counters: dict) -> dict:
     ws_id = ws["id"]
     ws_name = ws["name"]
-    ws_dir = _OUTPUT / "workspaces" / workspace_dirname(ws, all_workspaces)
+    ws_dir = _OUTPUT / "workspaces" / ws_dir_name
     items_dir = ws_dir / "items"
     files_dir = ws_dir / "files"
     items_dir.mkdir(parents=True, exist_ok=True)
@@ -196,81 +389,98 @@ def export_workspace(ws: dict, all_workspaces: list[dict], formats: set[str],
         json.dumps(ws, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
-    summary = {"workspace": ws_name, "items": 0, "collections": 0, "files": 0, "errors": 0}
+    summary = {"workspace": ws_name, "items": 0, "collections": 0,
+               "files": 0, "docx": 0, "errors": 0}
     write_json = "json" in formats
     write_md = "markdown" in formats
+    write_docx_fmt = "docx" in formats
+    # Cumulative URL-filename -> local-attachment-filename map for this workspace.
+    # Built incrementally as we download files; used for image link rewriting.
+    url_name_to_local: dict = {}
+    # Also populate the map from any existing on-disk attachments so resumes
+    # can rewrite without re-fetching file metadata.
+    if files_dir.exists():
+        for p in files_dir.iterdir():
+            if not p.is_file() or "__" not in p.name:
+                continue
+            stem_part, _, sid_ext = p.name.partition("__")
+            # The URL-side filename is "<stem>.<ext>" (drop the __<short-id>)
+            if "." in sid_ext:
+                _, ext = sid_ext.rsplit(".", 1)
+                url_name_to_local[f"{stem_part}.{ext}"] = p.name
+            else:
+                url_name_to_local[stem_part] = p.name
 
-    after: str | None = None
-    page = 0
-    while True:
-        page += 1
-        params: dict = {"workspaceId": ws_id, "limit": 100}
-        if after:
-            params["after"] = after
-        try:
-            resp = api_get("/items", params)
-        except Exception as e:
-            log_err(f"[{ws_name}] list page {page}: {e}")
-            summary["errors"] += 1
-            break
-        results = resp.get("data", {}).get("results", [])
-        if not results:
-            break
-        print(f"  [{ws_name}] page {page}: {len(results)} entries", flush=True)
+    print(f"  [{ws_name}] processing {len(entries)} entries", flush=True)
 
-        for entry in results:
-            obj_type = entry.get("object")
-            entry_id = entry.get("id")
-            entry_title = entry.get("title", "") or ""
-            base = item_basename(entry_title, entry_id)
-            json_path = items_dir / f"{base}.json"
-            md_path = items_dir / f"{base}.md"
-            # If the title changed since last export, an old file with a
-            # different slug but the same short-id may exist. Reuse it.
-            existing_json = find_existing(items_dir, entry_id, "json")
-            existing_md = find_existing(items_dir, entry_id, "md")
-            if existing_json:
-                json_path = existing_json
-            if existing_md:
-                md_path = existing_md
+    for entry in entries:
+        obj_type = entry.get("object")
+        entry_id = entry.get("id")
+        entry_title = entry.get("title", "") or ""
+        base = item_basename(entry_title, entry_id)
+        json_path = items_dir / f"{base}.json"
+        md_path = items_dir / f"{base}.md"
+        docx_path = items_dir / f"{base}.docx"
+        # If the title changed since last export, reuse the existing file
+        # found by short-id rather than creating a duplicate under the new slug.
+        existing_json = find_existing(items_dir, entry_id, "json")
+        existing_md = find_existing(items_dir, entry_id, "md")
+        existing_docx = find_existing(items_dir, entry_id, "docx")
+        if existing_json:
+            json_path = existing_json
+        if existing_md:
+            md_path = existing_md
+        if existing_docx:
+            docx_path = existing_docx
 
-            if obj_type == "item":
-                json_ready = json_path.exists()
-                md_ready = md_path.exists()
-                need_fetch = (write_json and not json_ready) or (write_md and not md_ready)
+        if obj_type == "item":
+            json_ready = json_path.exists()
+            md_ready = md_path.exists()
+            docx_ready = docx_path.exists()
+            # We need the item content body if any output is missing or if we
+            # want files downloaded (the file list lives in contentMeta).
+            need_content = (
+                (write_json and not json_ready)
+                or (write_md and not md_ready)
+                or (write_docx_fmt and not docx_ready)
+                or download_files
+            )
 
-                full: dict | None = None
-                if need_fetch:
+            full: dict | None = None
+            if need_content:
+                if json_ready:
+                    try:
+                        full = json.loads(json_path.read_text(encoding="utf-8"))
+                        counters["items_skipped"] += 1
+                    except Exception as e:
+                        log_err(f"[{ws_name}] read json {entry_id}: {e}")
+                        summary["errors"] += 1
+                        continue
+                else:
                     try:
                         full = api_get(f"/items/{entry_id}")["data"]
                     except Exception as e:
                         log_err(f"[{ws_name}] get item {entry_id}: {e}")
                         summary["errors"] += 1
                         continue
-                    if write_json and not json_ready:
+                    if write_json:
                         json_path.write_text(
-                            json.dumps(full, indent=2, ensure_ascii=False), encoding="utf-8"
+                            json.dumps(full, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
                         )
-                    if write_md and not md_ready:
-                        try:
-                            write_markdown(md_path, full, ws_name)
-                        except Exception as e:
-                            log_err(f"[{ws_name}] write md {entry_id}: {e}")
-                            summary["errors"] += 1
                     counters["items_fetched"] += 1
-                else:
-                    counters["items_skipped"] += 1
-                summary["items"] += 1
+            else:
+                counters["items_skipped"] += 1
+            summary["items"] += 1
 
-                if download_files:
-                    # Reload JSON if not just fetched, to get fileIds
-                    if full is None and json_path.exists():
-                        try:
-                            full = json.loads(json_path.read_text(encoding="utf-8"))
-                        except Exception:
-                            full = None
-                    if not full:
-                        continue
+            # Download attachments and accumulate the URL-filename map.
+            if download_files:
+                if full is None and json_path.exists():
+                    try:
+                        full = json.loads(json_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        full = None
+                if full:
                     file_ids = (full.get("contentMeta") or {}).get("fileIds") or []
                     for fid in file_ids:
                         existing = list(files_dir.glob(f"*__{short_id(fid)}.*"))
@@ -287,31 +497,84 @@ def export_workspace(ws: dict, all_workspaces: list[dict], formats: set[str],
                             continue
                         url = (meta.get("download") or {}).get("url")
                         fname = meta.get("fileName") or fid
-                        dest = files_dir / attachment_filename(fname, fid)
+                        local = attachment_filename(fname, fid)
+                        dest = files_dir / local
                         if not url:
                             log_err(f"[{ws_name}] file {fid}: no download url")
                             summary["errors"] += 1
                             continue
                         try:
                             download_url(url, dest)
+                            url_name_to_local[fname] = local
                             summary["files"] += 1
                             counters["files_fetched"] += 1
                         except Exception as e:
                             log_err(f"[{ws_name}] download {fid} ({fname}): {e}")
                             summary["errors"] += 1
 
-            elif obj_type == "collection":
-                if write_json and not json_path.exists():
-                    json_path.write_text(
-                        json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8"
+            # Markdown / docx output (with link rewriting).
+            need_md_write = write_md and not md_ready
+            need_docx_write = write_docx_fmt and not docx_ready
+            if (need_md_write or need_docx_write) and full is None:
+                # Should already be loaded above; defensive reload.
+                if json_path.exists():
+                    try:
+                        full = json.loads(json_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        full = None
+            if (need_md_write or need_docx_write) and full:
+                raw_content = full.get("content", "") or ""
+                if need_md_write:
+                    md_content = rewrite_links(
+                        raw_content,
+                        item_index=item_index,
+                        this_ws_dir=ws_dir_name,
+                        file_by_url_name=url_name_to_local,
+                        target_ext=".md",
                     )
-                summary["collections"] += 1
-            else:
-                log_err(f"[{ws_name}] unknown object type: {obj_type} id={entry_id}")
+                    try:
+                        md_path.write_text(
+                            render_markdown(full, md_content, ws_name),
+                            encoding="utf-8",
+                        )
+                    except Exception as e:
+                        log_err(f"[{ws_name}] write md {entry_id}: {e}")
+                        summary["errors"] += 1
+                if need_docx_write:
+                    docx_content = rewrite_links(
+                        raw_content,
+                        item_index=item_index,
+                        this_ws_dir=ws_dir_name,
+                        file_by_url_name=url_name_to_local,
+                        target_ext=".docx",
+                    )
+                    # Pandoc reads from a file so it can resolve --resource-path
+                    # for inline images; use a temp markdown file next to the
+                    # target so relative `../files/...` references work.
+                    tmp_md = items_dir / f".{base}.docx-source.md"
+                    try:
+                        tmp_md.write_text(
+                            render_markdown(full, docx_content, ws_name),
+                            encoding="utf-8",
+                        )
+                        write_docx(tmp_md, docx_path)
+                        summary["docx"] += 1
+                        counters["docx_written"] += 1
+                    except Exception as e:
+                        log_err(f"[{ws_name}] write docx {entry_id}: {e}")
+                        summary["errors"] += 1
+                    finally:
+                        if tmp_md.exists():
+                            tmp_md.unlink()
 
-        if len(results) < 100:
-            break
-        after = results[-1]["id"]
+        elif obj_type == "collection":
+            if write_json and not json_path.exists():
+                json_path.write_text(
+                    json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+            summary["collections"] += 1
+        else:
+            log_err(f"[{ws_name}] unknown object type: {obj_type} id={entry_id}")
 
     (ws_dir / "_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -355,8 +618,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Limit to specific workspace ID(s). Repeatable. Default: all workspaces.",
     )
     p.add_argument(
-        "--format", choices=("both", "markdown", "json"), default="both",
-        help="Per-item output format (default: %(default)s).",
+        "--format", default="markdown,json", metavar="FORMATS",
+        help="Comma-separated output formats per item: any of 'markdown' "
+             "(or 'md'), 'json', 'docx'. Default: %(default)s. The legacy "
+             "value 'both' is accepted as an alias for 'markdown,json'. "
+             "'docx' requires pandoc on PATH.",
     )
     p.add_argument(
         "--skip-files", action="store_true",
@@ -379,23 +645,35 @@ def main(argv: list[str] | None = None) -> int:
     _OUTPUT.mkdir(parents=True, exist_ok=True)
     _ERRORS_PATH = _OUTPUT / "errors.log"
 
-    formats = {"markdown", "json"} if args.format == "both" else {args.format}
+    formats = parse_formats(args.format)
+    if "docx" in formats:
+        require_pandoc()
     download_files = not args.skip_files
     workspace_filter = set(args.workspace)
 
     start = time.time()
     print(f"Output: {_OUTPUT}", flush=True)
+    print(f"Formats: {','.join(sorted(formats))}", flush=True)
     print("== Listing teams ==", flush=True)
     teams = api_get("/teams")["data"]["results"]
     if not teams:
         print("No teams accessible with this token.", file=sys.stderr)
         return 1
 
+    print("\n== Discovery: indexing all items for cross-reference resolution ==",
+          flush=True)
+    item_index, ws_dir_by_id, plan = discover(teams, workspace_filter)
+    (_OUTPUT / "_index.json").write_text(
+        json.dumps(item_index, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"  indexed {len(item_index)} items across {len(plan)} workspaces",
+          flush=True)
+
     manifest = {
         "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "tool_version": "0.1.0",
+        "tool_version": "0.2.0",
         "options": {
-            "format": args.format,
+            "format": sorted(formats),
             "download_files": download_files,
             "throttle": _THROTTLE,
             "workspace_filter": sorted(workspace_filter) or None,
@@ -405,21 +683,24 @@ def main(argv: list[str] | None = None) -> int:
     counters = {
         "items_fetched": 0, "items_skipped": 0,
         "files_fetched": 0, "files_skipped": 0,
+        "docx_written": 0,
     }
+    team_summaries: dict = {}
 
-    for team in teams:
+    for team, ws, entries in plan:
         team_id = team["id"]
         team_name = team["name"]
-        print(f"\n== Team: {team_name} ({team_id}) ==", flush=True)
-        ws_list = api_get("/workspaces", {"teamId": team_id})["data"]["results"]
-        team_summary = {"team": team_name, "team_id": team_id, "workspaces": []}
-        for ws in ws_list:
-            if workspace_filter and ws["id"] not in workspace_filter:
-                continue
-            print(f"\n-- Workspace: {ws['name']} --", flush=True)
-            s = export_workspace(ws, ws_list, formats, download_files, counters)
-            team_summary["workspaces"].append(s)
-        manifest["teams"].append(team_summary)
+        if team_id not in team_summaries:
+            print(f"\n== Team: {team_name} ({team_id}) ==", flush=True)
+            team_summaries[team_id] = {"team": team_name, "team_id": team_id,
+                                        "workspaces": []}
+        print(f"\n-- Workspace: {ws['name']} --", flush=True)
+        s = export_workspace(
+            ws, ws_dir_by_id[ws["id"]], entries, formats, download_files,
+            item_index, counters,
+        )
+        team_summaries[team_id]["workspaces"].append(s)
+    manifest["teams"] = list(team_summaries.values())
 
     manifest["counters"] = counters
     manifest["duration_seconds"] = round(time.time() - start, 1)
