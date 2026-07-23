@@ -109,13 +109,18 @@ def parse_formats(spec: str) -> set[str]:
 
 # --- link rewriting ---------------------------------------------------------
 
-_IMAGE_RE = re.compile(
-    r"!\[([^\]]*)\]\(https://files\.nuclino\.com/files/[^/]+/([^)]+)\)"
+_UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+# Any reference to a Nuclino-hosted file: image embeds (`![alt](url)`) and plain
+# links (`[name](url)`) alike, with the URL optionally wrapped in <> (Nuclino does
+# this when the filename contains spaces). The file's UUID is captured so we can
+# match it to the locally-downloaded attachment by short-id.
+_FILE_LINK_RE = re.compile(
+    r"(!?)\[([^\]]*)\]\(<?https://files\.nuclino\.com/files/"
+    rf"({_UUID_PATTERN})/[^)>]*>?\)"
 )
 _USER_LINK_RE = re.compile(
     r"\[([^\]]+)\]\(https://app\.nuclino\.com/users/[^)]+\)"
 )
-_UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _ITEM_TB_LINK_RE = re.compile(
     rf"\[([^\]]+)\]\(https://app\.nuclino\.com/t/b/({_UUID_PATTERN})[^)]*\)"
 )
@@ -129,33 +134,31 @@ def rewrite_links(
     *,
     item_index: dict,
     this_ws_dir: str,
-    file_by_url_name: dict,
+    file_by_shortid: dict,
     target_ext: str,
 ) -> str:
     """Rewrite Nuclino URLs to local references.
 
-    - Inline images: rewritten to `../files/<localname>` when a matching local
-      attachment is known. Unknown attachments are left untouched.
+    - File references (both image embeds `![alt](url)` and plain links
+      `[name](url)`): rewritten to `../files/<localname>` when the file's UUID
+      matches a locally-downloaded attachment (by short-id). Files that weren't
+      downloaded (e.g. under --skip-files) are left untouched.
     - User mention links: the URL is dropped, only the display name remains.
     - Cross-doc references (`/t/b/<uuid>` and team-path forms): rewritten to a
       relative path to the target item's local file with `target_ext`.
       Unresolvable references (UUID not in the index) keep only the link text.
     """
-    def image_repl(m: re.Match) -> str:
-        alt, url_name = m.group(1), m.group(2)
-        local = file_by_url_name.get(url_name)
-        if not local:
-            # Fallback for exports whose on-disk stems were truncated to the
-            # first 8 hex chars by an earlier rename pass: try the 8-char
-            # prefix of the URL filename stem.
-            if "." in url_name:
-                stem, ext = url_name.rsplit(".", 1)
-                local = file_by_url_name.get(f"{stem[:8]}.{ext}")
-            else:
-                local = file_by_url_name.get(url_name[:8])
+    def file_repl(m: re.Match) -> str:
+        bang, text, uuid = m.group(1), m.group(2), m.group(3)
+        local = file_by_shortid.get(short_id(uuid))
         if not local:
             return m.group(0)
-        return f"![{alt}](../files/{local})"
+        target = f"../files/{local}"
+        # Angle-bracket the target if it contains spaces so markdown parsers
+        # (and pandoc) treat the whole path as the URL.
+        if " " in target:
+            target = f"<{target}>"
+        return f"{bang}[{text}]({target})"
 
     def user_repl(m: re.Match) -> str:
         return m.group(1)
@@ -175,7 +178,7 @@ def rewrite_links(
             target_path = f"../../{target_ws_dir}/items/{target_basename}{target_ext}"
         return f"[{text}]({target_path})"
 
-    content = _IMAGE_RE.sub(image_repl, content)
+    content = _FILE_LINK_RE.sub(file_repl, content)
     content = _USER_LINK_RE.sub(user_repl, content)
     content = _ITEM_TB_LINK_RE.sub(item_repl, content)
     content = _ITEM_TEAM_LINK_RE.sub(item_repl, content)
@@ -387,22 +390,23 @@ def export_workspace(ws: dict, ws_dir_name: str, entries: list[dict],
     write_json = "json" in formats
     write_md = "md" in formats
     write_docx_fmt = "docx" in formats
-    # Cumulative URL-filename -> local-attachment-filename map for this workspace.
-    # Built incrementally as we download files; used for image link rewriting.
-    url_name_to_local: dict = {}
+    # Cumulative file-short-id -> local-attachment-filename map for this
+    # workspace. Built incrementally as we download files; used to rewrite both
+    # image embeds and plain file links to their local copies. Keyed by short-id
+    # (first UUID segment) because it's collision-free, unlike the filename
+    # (many attachments are literally named "image.png").
+    shortid_to_local: dict = {}
     # Also populate the map from any existing on-disk attachments so resumes
     # can rewrite without re-fetching file metadata.
     if files_dir.exists():
         for p in files_dir.iterdir():
             if not p.is_file() or "__" not in p.name:
                 continue
-            stem_part, _, sid_ext = p.name.partition("__")
-            # The URL-side filename is "<stem>.<ext>" (drop the __<short-id>)
-            if "." in sid_ext:
-                _, ext = sid_ext.rsplit(".", 1)
-                url_name_to_local[f"{stem_part}.{ext}"] = p.name
-            else:
-                url_name_to_local[stem_part] = p.name
+            # Filename is "<stem>__<short-id>[.<ext>]"; take the last __ segment.
+            _, _, sid_ext = p.name.rpartition("__")
+            sid = sid_ext.split(".", 1)[0]
+            if sid:
+                shortid_to_local[sid] = p.name
 
     print(f"  [{ws_name}] processing {len(entries)} entries", flush=True)
 
@@ -498,7 +502,7 @@ def export_workspace(ws: dict, ws_dir_name: str, entries: list[dict],
                             continue
                         try:
                             download_url(url, dest)
-                            url_name_to_local[fname] = local
+                            shortid_to_local[short_id(fid)] = local
                             summary["files"] += 1
                             counters["files_fetched"] += 1
                         except Exception as e:
@@ -522,7 +526,7 @@ def export_workspace(ws: dict, ws_dir_name: str, entries: list[dict],
                         raw_content,
                         item_index=item_index,
                         this_ws_dir=ws_dir_name,
-                        file_by_url_name=url_name_to_local,
+                        file_by_shortid=shortid_to_local,
                         target_ext=".md",
                     )
                     try:
@@ -538,7 +542,7 @@ def export_workspace(ws: dict, ws_dir_name: str, entries: list[dict],
                         raw_content,
                         item_index=item_index,
                         this_ws_dir=ws_dir_name,
-                        file_by_url_name=url_name_to_local,
+                        file_by_shortid=shortid_to_local,
                         target_ext=".docx",
                     )
                     # Pandoc reads from a file so it can resolve --resource-path
